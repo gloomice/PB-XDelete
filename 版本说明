@@ -1,0 +1,84 @@
+ * V107:
+ * - 空跑/--list 打不开/零有效目标 → EXIT_CODE:3（不再假成功 0）
+ * - 用户中止后仍尽力按 depth 清理空目录（best-effort）
+ * - TryRemoveDir：DIR_NOT_EMPTY 短退避重试（POSIX 关句柄窗口）
+ * V106:
+ * - 平滑停止：CreateEventW(Local\\PB_XDelete_StopEvent)；不 ResetEvent（由 GUI 在 Popen 前复位）
+ * V105:
+ * - LoadPathW：路径不存在 WARN；ACCESS_DENIED 等计入失败并影响 EXIT_CODE:3
+ * V104:
+ * - 退出码：0=全成功；1=参数错误；2=用户中止；3=部分失败(Files_Fail/Dirs_Fail>0)
+ * - 汇总末输出 EXIT_CODE:N，便于 GUI/脚本解析（协议头仍为 PB_XDELETE_PROTOCOL:1）
+ * V103:
+ * - 扫描：无界 LIFO ScanStack（DFS）消除 Scanner 满队列自锁；pushBatch 一次加锁
+ * - FixPath：GetFullPathNameW 展开相对路径/正斜杠后再加 \\?\
+ * - FileItem{dirIdx,name,size}：队列不再存完整路径+vol；Worker 按目录缓存复用父路径
+ * - --list 大量单文件攒 BATCH 再入队；HDD 探测支持首目标为文件；去掉 DirNode::path_len
+ * - TryRemoveDir：FDIX 优先（与 TryDeleteFile 一致）
+ * V102:
+ * - TryDelete/TryRemoveDir：SHARING_VIOLATION/NOT_FOUND 快失败，仅 ACCESS_DENIED 走 TakeOwnership/ACL
+ * - GetVolumeRootKey：\\?\X:\ / UNC 字符串快路径，失败才 GetVolumePathNameW
+ * - 目录阶段：ReconstructPathTo 无锁；O(N) 按 depth 分桶（去掉全量 sort）
+ * - Small/Large Worker：按批 fetch_add(relaxed)；Dashboard join + g_dashboardDone；单文件路径入删除队列
+ * V101:
+ * - 每目录一次 GetVolumeRootKey，文件随 PathSize.vol 下传；FDIX 线程本地命中同卷则跳过 map 锁
+ * - 枚举：FindFirstFileExW(FindExInfoBasic | FIND_FIRST_EX_LARGE_FETCH)
+ * - 子目录：本目录内收集后 AddChildDirsBatch 一次加锁批量入树，再入 scanQueue
+ * V100:
+ * - Scanner：每目录批量 fetch_add(g_totalFilesFound)，降低海量小文件下原子竞争（对齐 Czkawka increase_items 批加）
+ * - 线程：--threads N / 环境变量 PB_XDELETE_THREADS；SSD 上 Scanner 提高到最多 4（HDD 仍强制 1）
+ * - 扫描：FindFirstFileW 失败输出 WARN（上限 50），便于权限/路径排查
+ * V99:
+ * - FDIX 路径：CreateFileW 成功后 SetFileInformationByHandle(FileIoPriorityHintInformation, IoPriorityHigh)，与线程级 I/O 优先级互补（对齐 pb_xflow VFS_Local_Open）
+ * V40.15:
+ * - 首个目标卷 IOCTL_STORAGE_QUERY_PROPERTY(SeekPenalty)：机械盘降低 Scanner/Small/Large/DirPool 并发，减轻寻道抖动
+ * - Scanner/Small/Large/DirWorker 线程 SetThreadInformation(ThreadIoPriority) 提高 I/O 优先级（内核可用时）
+ * V40.14:
+ * - Dashboard: newline-terminated [File]/[Dirs] line when stdout is not a console (pipe/redirect);
+ *   avoids merged lines like "[File]...PROGRESS:SCANNING:..." in GUI logs / readline-style readers
+ * V40.13:
+ * - argc<2: wcerr usage; stdout: PB_XDELETE_PROTOCOL:1 (GUI/脚本可校验)
+ * V40.12:
+ * - g_allDirs: parent-index + final segment (DirNode) replaces full-path vector; scan queue carries node index
+ * - ReconstructPathTo for enumeration/delete; depth/path_len stored at insert for sort (no full string compare)
+ * V40.11:
+ * - FDIX: per-volume cache (GetVolumePathNameW key) instead of global g_useFileDispositionEx (FAT U盘不再拖垮 NTFS)
+ * - TryRemoveDir: FileDispositionInfoEx on empty dirs (same flags as files)
+ * - Dir phase: condition_variable wait replaces sleep(1ms) spin on pending
+ * V40.10:
+ * - g_dirCount = g_allDirs.size() under g_dirListMtx (no drift); dir cleanup: atomic index dispatch (no per-layer queue)
+ * - fullPath/searchPath reserve(32768); depth sort keeps length tie-break
+ * V40.9:
+ * - Cached Administrators SID (TakeOwnership/GrantDacl); DeleteFileEx saves LastError before CloseHandle
+ * - atomic g_dirCount + queue approximate sizes; Dashboard uses lock for dir total / thread pool for dir phase
+ * V40.8:
+ * - g_scanQueue 500000 / QUEUE_LIMIT_LARGE 100000 (fixes scanner deadlock when ScanQ stuck at limit)
+ * V40.7:
+ * - QUEUE_LIMIT_LARGE = 20000 (prevents head-of-line blocking)
+ * V40.6:
+ * - EnablePrivilege: use L"..." literals (avoids UNICODE macro trap)
+ * - Progress: include dirs in total_items (fixes 100% stall during DirCleaner)
+ * V40.5:
+ * - LoadPath: lock g_dirListMtx when pushing to g_allDirs (fixes heap corruption race)
+ * - EnablePrivilege(SE_TAKE_OWNERSHIP_NAME|SE_RESTORE_NAME) at startup
+ * V40.4:
+ * - HIGH_PRIORITY_CLASS (was REALTIME, prevents system freeze)
+ * - g_totalBytesFreed + Bytes_Freed in SUMMARY
+ * V40.3:
+ * - TryRemoveDir: skip TakeOwnership/GrantDacl when ERROR_DIR_NOT_EMPTY (avoids ACL overhead)
+ * V40.2:
+ * - ScopedActiveGuard: RAII decrement on all exit paths (fixes counter leak when FindFirstFileW fails)
+ * V40.1:
+ * - GrantDaclFullControl: native SetEntriesInAclW (no cmd.exe process bomb)
+ * - g_scanComplete + PROGRESS:SCANNING during scan (fixes yo-yo progress bar)
+ * V40.0:
+ * - Atomic active count: onPopIncrement inside BlockingQueue::pop (closes pre-emption gap)
+ * V39.9:
+ * - Reparse point guard: do not traverse junctions/symlinks (prevents OOB delete + infinite loop)
+ * - Icacls fallback: after TakeOwnership, grant Administrators:F if delete still fails
+ * - Dynamic large workers: 2 threads when cores > 6
+ * V39.8: Manifest mode (--list)
+ * V39.7: Scan race fix, progress, zombie fix
+ * V39.6: Deadlock fix, dir depth-order, TakeOwnership, FAILED_PATHS
+ * V39.5: Dynamic threading, Dirs_Fail, TakeOwnership
+ * V39.4: FileDispositionInfoEx, unique_ptr, PROGRESS, graceful stop
